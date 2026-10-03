@@ -1,0 +1,9 @@
+{
+  "name": "Finance SMS Tracker",
+  "description": "Personal finance tracker that parses bank and UPI SMS messages, reconciles accounts, tracks Splitwise balances, and connects to Oracle finance ledger.",
+  "version": "1.0.0",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

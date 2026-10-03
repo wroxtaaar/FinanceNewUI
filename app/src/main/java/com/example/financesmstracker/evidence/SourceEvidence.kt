@@ -1,0 +1,30 @@
+package com.example.financesmstracker.evidence
+
+enum class SourceType {
+    SMS,
+    GMAIL_NOTIFICATION,
+    APP_NOTIFICATION
+}
+
+enum class EvidenceStatus {
+    UNMATCHED,
+    MATCHED,
+    AMBIGUOUS
+}
+
+data class SourceEvidence(
+    val id: Long = 0L,
+    val sourceType: SourceType,
+    val sourceKey: String,
+    val receivedAt: Long,
+    val transactionId: Long? = null,
+    val amountPaise: Long,
+    val currency: String = "INR",
+    val direction: String,
+    val bankProvider: String? = null,
+    val accountLastFour: String? = null,
+    val reference: String? = null,
+    val contentHash: String,
+    val confidence: Float = 1.0f,
+    val status: EvidenceStatus = EvidenceStatus.UNMATCHED
+)

@@ -1,0 +1,160 @@
+name: Deploy Oracle Finance
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Only the newest Oracle deployment should remain active.
+# A new push/workflow run cancels an older run in this deployment group.
+concurrency:
+  group: oracle-finance-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Check Oracle VPS
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          script: |
+            set -e
+            echo "Oracle VPS connection OK"
+            docker --version
+            docker compose version
+
+      - name: 2. Sync code from GitHub
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          script: |
+            set -e
+            cd ~/FinanceSMSTracker-kotlin
+            git fetch origin main
+            git reset --hard origin/main
+            echo "Deployed commit on VPS:"
+            git rev-parse HEAD
+            git log -1 --oneline
+
+      - name: 3. Configure Tailscale private access
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          ORACLE_TAILSCALE_AUTHKEY: ${{ secrets.ORACLE_TAILSCALE_AUTHKEY }}
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          envs: ORACLE_TAILSCALE_AUTHKEY
+          script: |
+            set -e
+            if ! command -v tailscale >/dev/null 2>&1; then
+              curl -fsSL https://tailscale.com/install.sh | sh
+            fi
+            if ! sudo tailscale status >/dev/null 2>&1; then
+              sudo tailscale up --auth-key="$ORACLE_TAILSCALE_AUTHKEY" --hostname=oracle-finance
+            fi
+            # Keep the finance API private on the default HTTPS port.
+            # Public Sheets traffic uses a separate Funnel HTTPS port so that
+            # configuring Funnel does not replace the private Serve endpoint.
+            sudo tailscale serve --bg 127.0.0.1:8090
+            sudo tailscale funnel --bg --https=8443 127.0.0.1:8091
+            echo "Tailscale private endpoint:"
+            sudo tailscale serve status
+            echo "Tailscale public Sheets endpoint:"
+            sudo tailscale funnel status
+
+      - name: 4. Stop current finance services
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          script: |
+            set -e
+            cd ~/FinanceSMSTracker-kotlin/oracle-finance
+
+            # The worker is profile-gated, so enable the profile during teardown.
+            # Otherwise docker compose down leaves finance-worker running and
+            # keeps the default network in use.
+            docker compose -f docker-compose.yml -f docker-compose.sheets.yml               --profile worker down --remove-orphans
+
+            # Remove a legacy Sheets container left behind by an older Compose
+            # project name so the current project can recreate it cleanly.
+            docker ps -aq --filter "name=_oracle-finance-finance-sheets-1" | xargs -r docker rm -f
+
+      - name: 5. Verify VPS commit
+        uses: appleboy/ssh-action@v1.2.2
+        env:
+          DEPLOY_COMMIT: ${{ github.sha }}
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          envs: DEPLOY_COMMIT
+          script: |
+            set -e
+            cd ~/FinanceSMSTracker-kotlin
+            ACTUAL="$(git rev-parse HEAD)"
+            echo "Expected commit: $DEPLOY_COMMIT"
+            echo "Actual commit:   $ACTUAL"
+            test "$ACTUAL" = "$DEPLOY_COMMIT"
+
+      - name: 6. Build finance services
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          script: |
+            set -e
+            cd ~/FinanceSMSTracker-kotlin/oracle-finance
+            if grep -Eq '^GMAIL_ENABLED=true([[:space:]]*)$' .env; then
+              docker compose -f docker-compose.yml -f docker-compose.sheets.yml build --no-cache finance-api finance-worker finance-sheets
+            else
+              docker compose -f docker-compose.yml -f docker-compose.sheets.yml build --no-cache finance-api finance-sheets
+            fi
+
+      - name: 7. Start finance services
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          script: |
+            set -e
+            cd ~/FinanceSMSTracker-kotlin/oracle-finance
+            if grep -Eq '^GMAIL_ENABLED=true([[:space:]]*)$' .env; then
+              docker compose -f docker-compose.yml -f docker-compose.sheets.yml --profile worker up -d finance-api finance-worker finance-sheets
+            else
+              docker compose -f docker-compose.yml -f docker-compose.sheets.yml up -d finance-api finance-sheets
+            fi
+
+      - name: 8. Health check
+        uses: appleboy/ssh-action@v1.2.2
+        with:
+          host: ${{ secrets.ORACLE_HOST }}
+          username: ${{ secrets.ORACLE_USER }}
+          key: ${{ secrets.ORACLE_SSH_KEY }}
+          port: ${{ secrets.ORACLE_SSH_PORT || '22' }}
+          script: |
+            set -e
+            cd ~/FinanceSMSTracker-kotlin/oracle-finance
+            sleep 3
+            curl --fail http://127.0.0.1:8090/health
+            curl --fail http://127.0.0.1:8091/health
+            docker compose -f docker-compose.yml -f docker-compose.sheets.yml ps
